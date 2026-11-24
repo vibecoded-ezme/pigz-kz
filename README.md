@@ -1,3 +1,11 @@
+# pigz-ks
+Fork of pigz adding KSflate
+
+```bash
+pigz -10 /path/to/file
+```
+
+## Original README
 pigz 2.8 (19 Aug 2022) by Mark Adler
 
 pigz, which stands for Parallel Implementation of GZip, is a fully functional

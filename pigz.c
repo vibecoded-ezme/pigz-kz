@@ -425,6 +425,9 @@
 #  error "Need zlib version 1.2.3 or later"
 #endif
 
+#include "ksflate.h"          // ksflate_compress(), ksflate_free()
+                                // (level 10, linked directly into this fork)
+
 #ifndef NOTHREAD
 #  include "yarn.h"     // thread, launch(), join(), join_all(), lock,
                         // new_lock(), possess(), twist(), wait_for(),
@@ -461,6 +464,10 @@
 
 // Sliding dictionary size for deflate.
 #define DICT 32768U
+
+// Level 10 is the ksflate engine, linked directly into this fork. Levels
+// 0..9 continue to use zlib and level 11 uses zopfli.
+#define KSFLATE_LEVEL 10
 
 // Largest power of 2 that fits in an unsigned int. Used to limit requests to
 // zlib functions that use unsigned int lengths.
@@ -1697,6 +1704,9 @@ local void compress_thread(void *dummy) {
     int bits;                       // deflate pending bits
 #endif
     int ret;                        // zlib return code
+    unsigned char *volatile dictbuf = NULL;  // level 10 history copy
+    size_t dictlen = 0;             // valid bytes in dictbuf
+    unsigned char *volatile histbuf = NULL;  // level 10 per-block history
     ball_t err;                     // error information from throw()
 
     (void)dummy;
@@ -1705,21 +1715,31 @@ local void compress_thread(void *dummy) {
         z_stream strm;                  // deflate stream
 #ifndef NOZOPFLI
         struct space *temp = NULL;
-        // get temporary space for zopfli input
-        if (g.level > 9)
-            temp = get_space(&out_pool);
-        else
 #endif
-        {
-            // initialize the deflate stream for this thread
-            strm.zfree = ZFREE;
-            strm.zalloc = ZALLOC;
-            strm.opaque = OPAQUE;
-            ret = deflateInit2(&strm, 6, Z_DEFLATED, -15, 8, g.strategy);
-            if (ret == Z_MEM_ERROR)
-                throw(ENOMEM, "not enough memory");
-            if (ret != Z_OK)
-                throw(EINVAL, "internal error");
+        if (g.level == KSFLATE_LEVEL) {
+            // The ksflate engine has no streaming state of its own; each
+            // chunk is compressed independently with an explicit history.
+            dictbuf = alloc(NULL, DICT);
+            histbuf = alloc(NULL, DICT);
+        }
+        else {
+#ifndef NOZOPFLI
+            // get temporary space for zopfli input
+            if (g.level > 9)
+                temp = get_space(&out_pool);
+            else
+#endif
+            {
+                // initialize the deflate stream for this thread
+                strm.zfree = ZFREE;
+                strm.zalloc = ZALLOC;
+                strm.opaque = OPAQUE;
+                ret = deflateInit2(&strm, 6, Z_DEFLATED, -15, 8, g.strategy);
+                if (ret == Z_MEM_ERROR)
+                    throw(ENOMEM, "not enough memory");
+                if (ret != Z_OK)
+                    throw(EINVAL, "internal error");
+            }
         }
 
         // keep looking for work
@@ -1740,14 +1760,13 @@ local void compress_thread(void *dummy) {
             // if deflateParams() is called immediately after deflateReset(),
             // there is no need to initialize input/output for the stream)
             Trace(("-- compressing #%ld", job->seq));
-#ifndef NOZOPFLI
+            dictlen = 0;
             if (g.level <= 9) {
-#endif
                 (void)deflateReset(&strm);
                 (void)deflateParams(&strm, g.level, g.strategy);
-#ifndef NOZOPFLI
             }
-            else
+#ifndef NOZOPFLI
+            else if (g.level > 9 && g.level != KSFLATE_LEVEL)
                 temp->len = 0;
 #endif
 
@@ -1757,11 +1776,13 @@ local void compress_thread(void *dummy) {
             if (job->out != NULL) {
                 len = job->out->len;
                 left = len < DICT ? len : DICT;
-#ifndef NOZOPFLI
                 if (g.level <= 9)
-#endif
                     deflateSetDictionary(&strm, job->out->buf + (len - left),
                                          (unsigned)left);
+                else if (g.level == KSFLATE_LEVEL) {
+                    memcpy(dictbuf, job->out->buf + (len - left), left);
+                    dictlen = left;
+                }
 #ifndef NOZOPFLI
                 else {
                     memcpy(temp->buf, job->out->buf + (len - left), left);
@@ -1773,14 +1794,12 @@ local void compress_thread(void *dummy) {
 
             // set up input and output
             job->out = get_space(&out_pool);
-#ifndef NOZOPFLI
             if (g.level <= 9) {
-#endif
                 strm.next_in = job->in->buf;
                 strm.next_out = job->out->buf;
-#ifndef NOZOPFLI
             }
-            else
+#ifndef NOZOPFLI
+            else if (g.level > 9 && g.level != KSFLATE_LEVEL)
                 memcpy(temp->buf + temp->len, job->in->buf, job->in->len);
 #endif
 
@@ -1788,6 +1807,93 @@ local void compress_thread(void *dummy) {
             next = job->lens == NULL ? NULL : job->lens->buf;
             left = job->in->len;
             job->out->len = 0;
+            if (g.level == KSFLATE_LEVEL) {
+                // Compress one block at a time so -R (rsyncable) block
+                // boundaries are honored. Each block gets the preceding 32 KiB
+                // of the dictionary plus earlier input as history.
+                size_t offset = 0;
+                do {
+                    // decode next block length from the rsync list (same
+                    // encoding as the zlib path below)
+                    len = next == NULL ? 128 : *next++;
+                    if (len < 128)
+                        len = (len << 8) + (*next++) + 64;
+                    else if (len == 128)
+                        len = left;
+                    else if (len < 192)
+                        len &= 0x3f;
+                    else if (len < 224) {
+                        len = ((len & 0x1f) << 16) + ((size_t)*next++ << 8);
+                        len += *next++ + 32832U;
+                    }
+                    else {
+                        len = ((len & 0x1f) << 24) + ((size_t)*next++ << 16);
+                        len += (size_t)*next++ << 8;
+                        len += (size_t)*next++ + 2129984UL;
+                    }
+                    if (len == 0 && offset != 0)
+                        break;          // terminator after an exact rsync hit
+
+                    // Assemble up to DICT bytes of history before this block.
+                    const unsigned char *hist = NULL;
+                    size_t histlen = 0;
+                    if (offset == 0) {
+                        hist = dictbuf;
+                        histlen = dictlen;
+                    }
+                    else if (offset >= DICT) {
+                        hist = job->in->buf + offset - DICT;
+                        histlen = DICT;
+                    }
+                    else {
+                        size_t need = DICT;
+                        if (dictlen + offset < need)
+                            need = dictlen + offset;
+                        {
+                            size_t dpart = need - offset;
+                            if (dpart > dictlen)
+                                dpart = dictlen;
+                            memcpy(histbuf, dictbuf + (dictlen - dpart), dpart);
+                            memcpy(histbuf + dpart, job->in->buf, offset);
+                        }
+                        hist = histbuf;
+                        histlen = need;
+                    }
+
+                    {
+                        size_t outlen = 0;
+                        int final = !job->more && left == len;
+                        unsigned char *packed =
+                            ksflate_compress(job->in->buf + offset, len,
+                                             hist, histlen,
+                                             g.strategy == Z_HUFFMAN_ONLY,
+                                             final, &outlen);
+                        if (packed == NULL)
+                            throw(ENOMEM, "not enough memory");
+                        while (job->out->size < job->out->len + outlen)
+                            grow_space(job->out);
+                        memcpy(job->out->buf + job->out->len, packed, outlen);
+                        job->out->len += outlen;
+                        ksflate_free(packed);
+
+                        if (!final && !g.setdict) {
+                            // -i: the zlib path emits a second empty stored
+                            // block so independent chunks are easy to spot.
+                            while (job->out->size < job->out->len + 5)
+                                grow_space(job->out);
+                            job->out->buf[job->out->len++] = 0;
+                            job->out->buf[job->out->len++] = 0;
+                            job->out->buf[job->out->len++] = 0;
+                            job->out->buf[job->out->len++] = 0xff;
+                            job->out->buf[job->out->len++] = 0xff;
+                        }
+                    }
+                    offset += len;
+                    left -= len;
+                } while (left);
+            }
+            else {
+            // levels 0..9 (zlib) and 11 (zopfli) use the streaming path
             do {
                 // decode next block length from blocks list
                 len = next == NULL ? 128 : *next++;
@@ -1900,6 +2006,7 @@ local void compress_thread(void *dummy) {
                 }
 #endif
             } while (left);
+            }
             drop_space(job->lens);
             job->lens = NULL;
             Trace(("-- compressed #%ld%s", job->seq,
@@ -1943,12 +2050,17 @@ local void compress_thread(void *dummy) {
 
         // found job with seq == -1 -- return to join
         release(compress_have);
+        if (g.level == KSFLATE_LEVEL) {
+            FREE(dictbuf);
+            dictbuf = NULL;
+            FREE(histbuf);
+            histbuf = NULL;
+        }
 #ifndef NOZOPFLI
-        if (g.level > 9)
+        else if (g.level > 9)
             drop_space(temp);
-        else
 #endif
-        {
+        else {
             (void)deflateEnd(&strm);
         }
     }
@@ -4193,7 +4305,7 @@ local void process(char *path) {
         }
     }
 #ifndef NOTHREAD
-    else if (g.procs > 1)
+    else if (g.procs > 1 || g.level == KSFLATE_LEVEL)
         parallel_compress();
 #endif
     else
@@ -4238,9 +4350,9 @@ local char *helptext[] = {
 "",
 "Options:",
 #ifdef NOZOPFLI
-"  -0 to -9             Compression level",
+"  -0 to -10            Compression level (10 is the ksflate engine)",
 #else
-"  -0 to -9, -11        Compression level (level 11, zopfli, is much slower)",
+"  -0 to -11            Compression level (10 ksflate, 11 zopfli)",
 #endif
 "  --fast, --best       Compression levels 1 and 9 respectively",
 "                       Level -0 is no compression. The default is -6",
@@ -4257,8 +4369,8 @@ local char *helptext[] = {
 "  -H, --huffman        Use only Huffman coding for compression",
 "  -i, --independent    Compress blocks independently for damage recovery",
 #ifndef NOZOPFLI
-"  -I, --iterations n   Number of iterations for -11 optimization (default 15)",
-"  -J, --maxsplits n    Maximum number of split blocks for -11 (default 15)",
+"  -I, --iterations n   Number of iterations for -11 optimization  (default 15)",
+"  -J, --maxsplits n    Maximum number of split blocks for -11  (default 15)",
 #endif
 "  -k, --keep           Do not delete original file after processing",
 "  -K, --zip            Compress to PKWare zip (.zip) single entry format",
@@ -4463,11 +4575,20 @@ local int option(char *arg) {
                 g.level = *arg - '0';
                 while (arg[1] >= '0' && arg[1] <= '9') {
                     if (g.level && (INT_MAX - (arg[1] - '0')) / g.level < 10)
-                        throw(EINVAL, "only levels 0..9 and 11 are allowed");
+                        throw(EINVAL, "only levels 0..11 are allowed");
                     g.level = g.level * 10 + *++arg - '0';
                 }
-                if (g.level == 10 || g.level > 11)
-                    throw(EINVAL, "only levels 0..9 and 11 are allowed");
+                if (g.level > 11)
+                    throw(EINVAL, "only levels 0..11 are allowed");
+#ifdef NOTHREAD
+                if (g.level == KSFLATE_LEVEL)
+                    throw(EINVAL, "level 10 requires threads");
+#endif
+#ifdef NOZOPFLI
+                if (g.level > KSFLATE_LEVEL)
+                    throw(EINVAL,
+                          "only levels 0..10 are allowed without zopfli");
+#endif
                 break;
             case 'A':  get = 6;  break;
             case 'C':  get = 7;  break;
@@ -4711,6 +4832,10 @@ int main(int argc, char **argv) {
             else if (option(argv[n]))   // process argument
                 argv[n] = NULL;         // remove if option
         option(NULL);                   // check for missing parameter
+
+        // level 10 has no RLE mode; reject rather than silently ignore -U
+        if (g.level == KSFLATE_LEVEL && g.strategy == Z_RLE)
+            throw(EINVAL, "level 10 does not support -U");
 
         // process command-line filenames
         done = 0;

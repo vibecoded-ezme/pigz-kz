@@ -4,7 +4,7 @@ pigz, unpigz \- compress or expand files
 .SH SYNOPSIS
 .ll +8
 .B pigz
-.RB [ " \-cdfhikKlLmMnNqrRtz0..9,11 " ]
+.RB [ " \-cdfhikKlLmMnNqrRtz0..11 " ]
 [
 .B -b
 .I blocksize
@@ -54,8 +54,9 @@ and wrapped with the appropriate header and trailer, where the trailer
 contains the combined check value.
 .PP
 Each partial raw deflate stream is terminated by an empty stored block
-(using the Z_SYNC_FLUSH option of zlib), in order to end that partial bit
-stream at a byte boundary.  That allows the partial streams to be
+(using the Z_SYNC_FLUSH option of zlib for levels 0 through 9, or an
+equivalent marker appended by the level 10 engine), in order to end that
+partial bit stream at a byte boundary.  That allows the partial streams to be
 concatenated simply as sequences of bytes.  This adds a very small four to
 five byte overhead to the output for each input chunk.
 .PP
@@ -67,7 +68,9 @@ which can be changed using the
 .B -p
 option.  Specifying
 .B -p 1
-avoids the use of threads entirely.
+avoids the use of threads entirely, except at compression level 10, which
+always uses the chunk pipeline described below even with a single process.
+Its output does not depend on the number of processes.
 .PP
 The input blocks, while compressed independently, have the last 32K of the
 previous block loaded as a preset dictionary to preserve the compression
@@ -123,6 +126,11 @@ or
 indicates the slowest compression method (best compression).
 .B -0
 is no compression.
+.B \-10
+uses the ksflate engine, which is slower than
+.B \-9
+but usually produces smaller output, and is much faster than
+.B \-11.
 .B \-11
 gives a few percent better compression at a severe cost in execution time,
 using the zopfli algorithm by Jyrki Alakuijala.
@@ -151,7 +159,8 @@ Force overwrite, compress .gz, links, and to terminal.
 Display a help screen and quit.
 .TP
 .B -H --huffman
-Compress using the Huffman-only strategy.
+Compress using the Huffman-only strategy.  At level 10 this selects the
+engine's literal-only mode, which uses the same Huffman coding but no matches.
 .TP
 .B -i --independent
 Compress blocks independently for damage recovery.
@@ -210,7 +219,8 @@ Use suffix .sss instead of .gz (for compression).
 Test the integrity of the compressed input.
 .TP
 .B -U --rle
-Compress using the run length encoding strategy.
+Compress using the run length encoding strategy.  This is not available at
+level 10.
 .TP
 .B -v --verbose
 Provide more verbose output.

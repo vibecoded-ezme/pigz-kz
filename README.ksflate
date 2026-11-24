@@ -1,0 +1,75 @@
+# pigz-ks
+
+A fork of [pigz 2.8](https://github.com/madler/pigz) (commit `fe4894f`) that
+adds the ksflate engine as compression level 10. Levels 0–9 still use zlib
+and level 11 still uses zopfli; only level 10 is new.
+
+The engine and its public C API are vendored under `engine/`, so this fork
+builds standalone with no sibling checkout. They are copies of `ksflate/src`
+and `ksflate/include/ksflate.h`, compiled as C++20; the pigz driver stays C.
+`make sync-engine` refreshes the copies from `../ksflate` when working inside
+the ksflate development tree.
+
+```sh
+make pigz       # builds ./pigz and ./unpigz
+make test       # upstream tests plus level-10 round-trips
+```
+
+## Level 10
+
+`-10` splits the input into the usual pigz chunks and sends each chunk to
+`ksflate_compress()`, the public C API implemented in
+`engine/ksflate_api.cpp` (canonical copy in `../ksflate`). That wrapper runs
+two strategy-0 optimization passes, emits raw deflate, and handles the chunk
+framing:
+
+* the last chunk sets `BFINAL`;
+* every other chunk ends with an empty stored sync marker, so chunks can be
+  concatenated on byte boundaries;
+* the previous chunk's last 32 KiB is passed as history, which keeps
+  cross-chunk LZ77 matches and therefore the ratio close to a single-threaded
+  compressor.
+
+`-i` / `--independent` turns the history off and adds the second empty stored
+block after each chunk, matching the zlib path's nine-byte independent marker.
+`-R` / `--rsyncable` is honored:
+each rsync block is compressed separately, with the preceding dictionary plus
+earlier bytes in the same chunk as history. `-H` / `--huffman` selects the
+engine's literal-only mode. `-U` / `--rle` is rejected for level 10 because the
+engine has no run-length-only mode.
+
+The engine output is deterministic: `-p 1`, `-p 4` and `-p 12` produce
+byte-identical gzip files.
+
+## Measurements
+
+6.2 MB mixed text/noise stream on a 12-core machine:
+
+| level | threads | time | size |
+|---|---|---|---|
+| 9 | 1 | 11.74 s | 718,164 B |
+| 10 | 1 | 10.05 s | 634,088 B |
+| 10 | 12 | 1.24 s | 634,088 B |
+| 9 | 12 | 1.15 s | 718,164 B |
+| 11 (zopfli) | 12 | 44.18 s | 632,902 B |
+
+Level 10 is about 12% smaller than level 9, scales ~8× on 12 cores, and lands
+within 0.2% of zopfli at roughly 1/35th the time on this input.
+
+## Tests
+
+`make test` runs the upstream pigz tests plus level-10 cases for the default
+chunking, `-p 1`, `-R -b 32`, `-i`, `-H`, zlib output (`-z`) and zip output
+(`-K`). Every case is decompressed with pigz's own test mode. It also builds
+and runs `tests/engine_wrapper.cpp`, which concatenates a non-final and a final
+`ksflate_compress()` segment and inflates the result with zlib.
+
+The engine-level history test lives in `../ksflate/tests/history.cpp` and is
+run by `make test` in `../ksflate`. It is not part of this repository, which
+only needs the vendored sources under `engine/`.
+
+## License
+
+The pigz license is unchanged; see `README` and the header of `pigz.c`.
+`engine/ksflate.h`, `engine/ksflate_api.cpp` and the vendored engine sources
+are new files under the same license.
